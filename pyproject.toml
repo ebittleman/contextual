@@ -1,0 +1,36 @@
+[project]
+name = "contextual"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "auth0-python>=4.9.0",
+    "httpx>=0.28.1",
+    "pyjwt[crypto]>=2.10.1",
+    "requests>=2.32.3",
+    "sqlalchemy>=2.0.41",
+]
+
+[dependency-groups]
+dev = [
+    "isort>=6.0.1",
+    "pyflakes>=3.3.2",
+    "sqlalchemy[mypy]>=2.0.41",
+    "types-auth0-python>=4.9.0.20250516",
+    "types-requests>=2.32.0.20250515",
+]
+
+[tool.mypy]
+plugins = "sqlalchemy.ext.mypy.plugin"
+
+[tool.pylsp-mypy]
+enabled = true
+live_mode = true
+strict = true
+exclude = ["tests/*"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
