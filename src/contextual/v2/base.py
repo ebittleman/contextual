@@ -3,17 +3,14 @@ import os
 import pprint
 import time
 from functools import wraps
-from typing import Callable, NotRequired, TextIO, TypedDict
+from typing import Any, Callable, NotRequired, TextIO, TypedDict
 
 import jwt
 import requests
 import sqlalchemy.orm
 from requests.exceptions import HTTPError
 from sqlalchemy import String, create_engine, select
-from sqlalchemy.orm import Mapped, mapped_column
-
-from contextual.auth import GetToken, OIDCConfig
-from contextual.base import Base
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 ###############################################################
 ###############################################################
@@ -59,6 +56,89 @@ type WriterFn[T] = Callable[[T], None]
 ###############################################################
 ###############################################################
 
+###############################################################
+###############################################################
+# START Http
+###############################################################
+###############################################################
+
+
+class HttpClient:
+    @staticmethod
+    def get(
+        http: Http,
+        url: str,
+        params: dict[str, Any] | list[Any] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> requests.Response:
+        """
+        Gets a url.
+        TODO: Add common error handling/retries
+        """
+        return http.get(url, params=params, headers=headers)
+
+    @staticmethod
+    def post(
+        http: Http,
+        url: str,
+        data: dict[str, Any] | list[Any] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> requests.Response:
+        """
+        Posts to url.
+        TODO: Add common error handling/retries
+        """
+        return http.post(url, data=data, headers=headers)
+
+
+###############################################################
+###############################################################
+# END Http
+###############################################################
+###############################################################
+
+###############################################################
+###############################################################
+# START OIDC Base
+###############################################################
+###############################################################
+
+
+class OIDCConfig(HttpClient):
+    def __init__(self, domain: str):
+        self.domain = domain
+        self.well_known_url = f"https://{self.domain}/.well-known/openid-configuration"
+        self._result: dict | None = None
+
+    def __call__(self, http: Http) -> dict:
+        if self._result is not None:
+            return self._result
+
+        resp = self.get(http, self.well_known_url)
+        resp.raise_for_status()
+        self._result = resp.json()
+        return self._result
+
+
+class OIDCClient(HttpClient):
+    def __init__(
+        self,
+        oidc_fn: Callable[[Http], dict],
+        client_id: str,
+        audience: str,
+        scopes: str,
+    ):
+        self.oidc_fn = oidc_fn
+        self.client_id = client_id
+        self.audience = audience
+        self.scopes = scopes
+
+
+###############################################################
+###############################################################
+# End OIDC Base
+###############################################################
+###############################################################
 
 ###############################################################
 ###############################################################
@@ -87,20 +167,23 @@ type TokenResolver[T, U] = Callable[[T], TokenFn[U]]
 type TokenWriter[T] = Callable[[Token], WriterFn[T]]
 
 
-class RefreshFromFileOrDeviceCode:
-    def __init__(self, get_token: GetToken, audience: str, scopes: str):
-        self.get_token = get_token
-        self.audience = audience
-        self.scopes = scopes
-
+class RefreshFromFileOrDeviceCode(OIDCClient):
     def __call__(self, file: File) -> TokenFn[Http]:
         def side_effect(http: Http) -> Token:
-            token = maybe(RefreshTokenFromFile(self.get_token)(file))(http)
+            token = maybe(
+                RefreshTokenFromFile(
+                    self.oidc_fn,
+                    self.client_id,
+                    self.audience,
+                    self.scopes,
+                )(file)
+            )(http)
             if token:
                 return token
 
             token = DeviceCodeLogin(
-                self.get_token,
+                self.oidc_fn,
+                self.client_id,
                 self.audience,
                 self.scopes,
             )(save_refresh_token_to_file, file)(http)
@@ -112,35 +195,36 @@ class RefreshFromFileOrDeviceCode:
         return side_effect
 
 
-class RefreshTokenFromFile:
-    def __init__(self, get_token: GetToken):
-        self.get_token = get_token
-
+class RefreshTokenFromFile(OIDCClient):
     def __call__(self, file: File) -> MaybeTokenFn[Http]:
         def side_effect(http: Http) -> Token | None:
             file.seek(0)
             token_file: RefreshTokenFile = json.load(file)
-            resp = self.get_token.refresh_token(token_file["refresh_token"])(
-                http
-            ).unwrap()
+            resp = self.refresh_token(http, token_file["refresh_token"])
             resp.raise_for_status()
             return resp.json()
 
         return side_effect
 
+    def refresh_token(self, http: Http, refresh_token: str) -> requests.Response:
+        url = self.oidc_fn(http)["token_endpoint"]
+        return self.post(
+            http,
+            url,
+            data={
+                "client_id": self.client_id,
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+            },
+        )
 
-class DeviceCodeLogin:
-    def __init__(self, get_token: GetToken, audience: str, scopes: str):
-        self.get_token = get_token
-        self.audience = audience
-        self.scopes = scopes
 
+class DeviceCodeLogin(OIDCClient):
     def __call__[T](
         self, token_writer: TokenWriter[T], storage: T
     ) -> MaybeTokenFn[Http]:
         def side_effect(http: Http) -> Token | None:
             token = self.login(http)
-
             token_writer(token)(storage)
             return token
 
@@ -150,9 +234,7 @@ class DeviceCodeLogin:
         """
         Login the user via the device code grant
         """
-        resp = self.get_token.generate_device_code(self.scopes, self.audience)(
-            http
-        ).unwrap()
+        resp = self.generate_device_code(http)
         device_code_request = resp.json()
         resp.raise_for_status()
 
@@ -165,7 +247,7 @@ class DeviceCodeLogin:
         while tries:
             error_code = None
             try:
-                resp = self.get_token.device_code(device_code_request)(http).unwrap()
+                resp = self.device_code(http, device_code_request)
                 token = resp.json()
                 resp.raise_for_status()
                 if "token_type" in token and token["token_type"] == "Bearer":
@@ -194,6 +276,40 @@ class DeviceCodeLogin:
                     raise Exception(f"Invalid Error Code {error_code}")
             tries -= 1
         raise Exception("Timeout, try again.")
+
+    def generate_device_code(self, http: Http) -> requests.Response:
+        url = self.oidc_fn(http)["device_authorization_endpoint"]
+        return self.post(
+            http,
+            url,
+            data={
+                "client_id": self.client_id,
+                "scope": self.scopes,
+                "audience": self.audience,
+            },
+        )
+
+    def device_code(self, http: Http, data: dict) -> requests.Response:
+        """
+        {
+            "device_code": "Ag_EE...ko1p",
+            "user_code": "QTZL-MCBW",
+            "verification_uri": "https://accounts.acmetest.org/activate",
+            "verification_uri_complete": "https://accounts.acmetest.org/activate?user_code=QTZL-MCBW",
+            "expires_in": 900,
+            "interval": 5
+        }
+        """
+        url = self.oidc_fn(http)["token_endpoint"]
+        return self.post(
+            http,
+            url,
+            data={
+                "client_id": self.client_id,
+                "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                "device_code": data["device_code"],
+            },
+        )
 
 
 def save_refresh_token_to_file(token: Token) -> WriterFn[File]:
@@ -232,19 +348,20 @@ type ClaimsFn[T] = Callable[[T], Claims]
 type JWKSFn[T] = Callable[[T], jwt.PyJWKSet]
 
 
-def jwks(oidc_fn: OIDCConfig) -> JWKSFn[Http]:
-    def side_effect(http: Http) -> jwt.PyJWKSet:
-        oidc_result = oidc_fn(http).unwrap()
+class JKWS(HttpClient):
+    def __init__(self, oidc_fn: OIDCConfig):
+        self.oidc_fn = oidc_fn
+
+    def __call__(self, http: Http) -> jwt.PyJWKSet:
+        oidc_result = self.oidc_fn(http)
         if "jwks_uri" not in oidc_result:
             raise Exception("JWKS URI not available.")
 
-        resp = http.get(oidc_result["jwks_uri"])
+        resp = self.get(http, oidc_result["jwks_uri"])
         resp.raise_for_status()
         data = resp.json()
 
         return jwt.PyJWKSet.from_dict(data)
-
-    return side_effect
 
 
 class VerifyAccessToken[T]:
@@ -306,13 +423,13 @@ type ProfileFn[T] = Callable[[T], Profile]
 type ProfileResolver[T] = Callable[[TokenFn[T]], ProfileFn[T]]
 
 
-class GetProfile:
+class GetProfile(HttpClient):
     def __init__(self, oidc_fn: OIDCConfig):
         self.oidc_fn = oidc_fn
 
     def get_profile(self, token_fn: TokenFn[Http]) -> ProfileFn[Http]:
         def side_effect(http: Http) -> Profile:
-            oidc = self.oidc_fn(http).unwrap()
+            oidc = self.oidc_fn(http)
 
             if "userinfo_endpoint" not in oidc:
                 raise Exception("Invalid OIDC payload")
@@ -320,7 +437,7 @@ class GetProfile:
 
             token_data = token_fn(http)
             token = token_data["access_token"]
-            resp = http.get(url, headers={"Authorization": f"Bearer {token}"})
+            resp = self.get(http, url, headers={"Authorization": f"Bearer {token}"})
             resp.raise_for_status()
 
             data: Profile = resp.json()
@@ -349,6 +466,10 @@ class GetProfile:
 # START User
 ###############################################################
 ###############################################################
+
+
+class Base(DeclarativeBase):
+    """Base class for ORM Models"""
 
 
 class User(Base):
@@ -478,12 +599,12 @@ def main():
     refresh_token_file = "refresh_token.json"
     scopes = "openid profile email offline_access"
 
-    get_token = GetToken(DOMAIN, CLIENT_ID)
-    oidc_fn = remember(OIDCConfig(get_token.domain))
-    jwks_fn = remember(jwks(oidc_fn))
+    oidc_fn = remember(OIDCConfig(DOMAIN))
+    jwks_fn = remember(JKWS(oidc_fn))
 
     token_resolver = RefreshFromFileOrDeviceCode(
-        get_token,
+        oidc_fn,
+        CLIENT_ID,
         AUDIENCE,
         scopes,
     )
