@@ -22,20 +22,6 @@ from contextual.base import Base
 ###############################################################
 
 
-#  labcdefg.a(bcd)(efg)
-def bald_eagle[B, C, D, E, F, G, R](
-    a: Callable[[B, C, D], Callable[[E, F, G], R]],
-    b: B,
-    c: C,
-    d: D,
-    e: E,
-    f: F,
-    g: G,
-) -> R:
-    fn = a(b, c, d)
-    return fn(e, f, g)
-
-
 def remember[T, U](fn: Callable[[T], U]) -> Callable[[T], U]:
     result = None
 
@@ -340,7 +326,8 @@ class GetProfile:
             data: Profile = resp.json()
             if not isinstance(data, dict):
                 raise ValueError(
-                    f"Invalid Profile Content. expected: dict, got: {type(data).__name__}"
+                    "Invalid Profile Content. "
+                    f"expected: dict, got: {type(data).__name__}"
                 )
 
             print("\n===========\nUser Profile:")
@@ -503,20 +490,16 @@ def main():
     profile_resolver = GetProfile(oidc_fn)
     user_resolver = DefaultUserResolver(jwks_fn, AUDIENCE)
 
+    authenticated_user = get_user_from_token(
+        token_resolver, profile_resolver, user_resolver
+    )
+
     with (
         open(refresh_token_file, mode="a+", encoding="utf8") as file,
         requests.Session() as http,
         sqlalchemy.orm.Session(engine) as db,
     ):
-        user = bald_eagle(
-            get_user_from_token,
-            token_resolver,
-            profile_resolver,
-            user_resolver,
-            file,
-            http,
-            db,
-        )
+        user = authenticated_user(file, http, db)
         print(user)
 
 
