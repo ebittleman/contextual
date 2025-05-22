@@ -285,7 +285,7 @@ def device_code_login(
     pprint.pprint(device_code_request)
     print()
 
-    tries = 10
+    tries = 900 / 5
     while tries:
         error_code = None
         try:
